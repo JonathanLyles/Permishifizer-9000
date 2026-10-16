@@ -33,6 +33,7 @@ Generate a **SalesforceBackup** permission set XML from live org metadata — en
     - [JSON Output](#json-output)
   - [Output](#output)
     - [Console Output](#console-output)
+  - [Testing](#testing)
   - [CI/CD Integration](#cicd-integration)
     - [Azure DevOps Pipelines](#azure-devops-pipelines)
     - [GitHub Actions](#github-actions)
@@ -296,6 +297,10 @@ Each entry generates:
 </userPermissions>
 ```
 
+Before writing the XML, the script checks the target org's supported `PermissionSet` fields. If it finds an unavailable configured permission, an interactive run lists the affected names and asks whether to continue without them. Confirming creates a partial permission set but deliberately skips same-run validation and deployment, even when `--check-only` or `--deploy` was supplied; the script prints separate Salesforce CLI commands for review, validation, and deployment.
+
+In CI/CD and `--json` mode, the script does not prompt. It exits with an error before writing the output file and reports the unsupported names so the configuration can be updated or reviewed interactively.
+
 ### JSON Output
 
 Add `--json` (`-j`) to emit a machine-readable summary to **stdout** after the run. All human-readable progress is redirected to **stderr**, so stdout carries only the JSON document — safe to parse in a pipeline.
@@ -324,6 +329,17 @@ Example output:
 ```
 
 `targetOrg` is `null` when the org is resolved from the Salesforce CLI default. `deployed` is `true` only when `--deploy` runs and succeeds; `validated` is `true` only when `--check-only` runs and succeeds. The [exit codes](#cicd-integration) are unchanged, so pipelines can branch on both the JSON payload and the process exit status.
+
+When an unsupported user permission is detected, JSON mode exits with code `1` and writes an error payload instead of creating an output file:
+
+```json
+{
+  "error": "Unsupported user permissions in target org.",
+  "unsupportedUserPermissions": [
+    "ManageQuotas"
+  ]
+}
+```
 
 ## Output
 
@@ -399,6 +415,16 @@ Permission set written: .../SalesforceBackup.permissionset-meta.xml
 Done!
 Deploy with: sf project deploy start --ignore-conflicts --source-dir "..."
 ```
+
+## Testing
+
+The test suite uses Python's standard-library `unittest` framework and mocks Salesforce CLI and API interactions. It does not require an authenticated org or deploy metadata.
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+For an optional live integration check, use `--check-only` against a representative scratch org after the automated suite passes.
 
 ## CI/CD Integration
 
