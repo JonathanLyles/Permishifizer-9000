@@ -21,6 +21,9 @@ $RECYCLE.BIN/
 # VS Code settings
 .vscode/
 
+# Local notes
+/notes/
+
 # Python Salesforce Functions
 **/__pycache__/
 

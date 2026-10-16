@@ -231,6 +231,100 @@ def die(message):
     raise ScriptError(message)
 
 
+def permission_set_field_name(permission_name):
+    return f"Permissions{permission_name}"
+
+
+def fetch_supported_user_permission_names(org):
+    endpoint = f"{org.rest_base}/sobjects/PermissionSet/describe"
+    data = http_get_json(
+        endpoint,
+        context="PermissionSet describe",
+        org=org,
+        include_error_body=False,
+    )
+    fields = data.get("fields") if isinstance(data, dict) else None
+    if not isinstance(fields, list) or not fields:
+        die(
+            "Error: PermissionSet describe response did not contain a non-empty "
+            "`fields` array."
+        )
+
+    supported = set()
+    permission_prefix = permission_set_field_name("")
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+        field_name = field.get("name")
+        if not isinstance(field_name, str) or not field_name.startswith(permission_prefix):
+            continue
+        permission_name = field_name.removeprefix(permission_prefix)
+        if permission_name:
+            supported.add(permission_name)
+
+    if not supported:
+        die(
+            "Error: PermissionSet describe response did not contain any "
+            "user-permission fields."
+        )
+
+    return supported
+
+
+def unsupported_user_permission_names(configured_names, supported_names):
+    return sorted(set(configured_names) - set(supported_names))
+
+
+def is_interactive_terminal(stdin=None, stderr=None):
+    stdin = stdin if stdin is not None else sys.stdin
+    stderr = stderr if stderr is not None else sys.stderr
+
+    try:
+        return stdin.isatty() and stderr.isatty()
+    except (AttributeError, OSError):
+        return False
+
+
+def confirm_unsupported_user_permissions(unsupported_names):
+    print(
+        "Warning: The target org does not support these configured user permissions:",
+        file=sys.stderr,
+    )
+    for permission_name in unsupported_names:
+        print(f"  - {permission_name}", file=sys.stderr)
+    print(
+        "Availability can depend on Salesforce edition, enabled features, "
+        "licenses, or API version.",
+        file=sys.stderr,
+    )
+
+    try:
+        response = input(
+            "Continue without these permissions? [y/N] "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+    return response in {"y", "yes"}
+
+
+def deploy_command(output_file, target_org, check_only=False):
+    parts = [
+        "sf",
+        "project",
+        "deploy",
+        "start",
+        "--ignore-conflicts",
+        "--source-dir",
+        str(output_file),
+    ]
+    if check_only:
+        parts.append("--dry-run")
+    if target_org:
+        parts.extend(["--target-org", target_org])
+    return " ".join(shlex.quote(part) for part in parts)
+
+
 def decode_subprocess_output(raw_data):
     if raw_data is None:
         return ""
@@ -584,7 +678,7 @@ def run_sf_project_deploy(output_file, target_org, sf_invoker, wait_minutes, che
         print(decode_subprocess_output(proc.stdout))
 
 
-def http_get_json(url, context, org):
+def http_get_json(url, context, org, include_error_body=True):
     req = urllib.request.Request(
         url,
         headers={
@@ -603,7 +697,8 @@ def http_get_json(url, context, org):
         die(f"Error: Timeout after {HTTP_TIMEOUT_SECONDS}s during {context}")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode(errors="replace")
-        die(f"Error: HTTP {exc.code} during {context}\n  {body[:400]}")
+        details = f"\n  {body[:400]}" if include_error_body else ""
+        die(f"Error: HTTP {exc.code} during {context}{details}")
     except urllib.error.URLError as exc:
         reason = str(exc.reason) if hasattr(exc, "reason") else str(exc)
         lowered = reason.lower()
@@ -871,9 +966,6 @@ def main():
     if args.deploy and args.check_only:
         die("Error: --deploy and --check-only cannot be used together.")
 
-    if args.deploy or args.check_only:
-        validate_deploy_preconditions(output_file)
-
     sf_invoker = resolve_sf_invoker()
     if sf_invoker is None:
         die(
@@ -942,6 +1034,51 @@ def main():
         instance_url=instance_url,
         api_version=api_version,
     )
+
+    unsupported_permissions = []
+    partial_user_permissions = False
+    effective_user_permission_names = set(USER_PERMISSION_NAMES)
+    if effective_user_permission_names:
+        supported_user_permissions = fetch_supported_user_permission_names(org)
+        unsupported_permissions = unsupported_user_permission_names(
+            effective_user_permission_names,
+            supported_user_permissions,
+        )
+
+        if unsupported_permissions:
+            unsupported_list = ", ".join(unsupported_permissions)
+            if args.json:
+                sys.stdout = original_stdout
+                print(
+                    json.dumps(
+                        {
+                            "error": "Unsupported user permissions in target org.",
+                            "unsupportedUserPermissions": unsupported_permissions,
+                        },
+                        indent=2,
+                    )
+                )
+                die(
+                    "Error: The target org does not support these configured "
+                    f"user permissions: {unsupported_list}"
+                )
+
+            if not is_interactive_terminal():
+                die(
+                    "Error: The target org does not support these configured "
+                    f"user permissions: {unsupported_list}\n"
+                    "Re-run interactively to decide whether to continue without them."
+                )
+
+            if not confirm_unsupported_user_permissions(unsupported_permissions):
+                print(
+                    "Canceled. No permission-set file was written or replaced.",
+                    file=sys.stderr,
+                )
+                return
+
+            partial_user_permissions = True
+            effective_user_permission_names.difference_update(unsupported_permissions)
 
     print("Querying org metadata (this may take several minutes for large orgs)...")
     print("")
@@ -1219,7 +1356,7 @@ def main():
         rt_vis_elements.append(rt_vis)
 
     user_perm_elements = []
-    for permission_name in sorted(USER_PERMISSION_NAMES):
+    for permission_name in sorted(effective_user_permission_names):
         user_perm = ET.Element(qtag("userPermissions"))
         ET.SubElement(user_perm, qtag("enabled")).text = "true"
         ET.SubElement(user_perm, qtag("name")).text = permission_name
@@ -1255,7 +1392,15 @@ def main():
 
     deployed = False
     validated = False
-    if args.check_only:
+    if partial_user_permissions:
+        print(
+            "The generated permission set excludes unsupported user permissions. "
+            "Review it before validating or deploying."
+        )
+        print(f'Validate with: {deploy_command(output_file, target_org, check_only=True)}')
+        print(f'Deploy with:   {deploy_command(output_file, target_org)}')
+    elif args.check_only:
+        validate_deploy_preconditions(output_file)
         print(
             f"Validating generated permission set (check-only, wait up to {args.deploy_wait} minute(s))..."
         )
@@ -1263,6 +1408,7 @@ def main():
         validated = True
         print("Validation completed successfully (no changes were deployed).")
     elif args.deploy:
+        validate_deploy_preconditions(output_file)
         print(
             f"Deploying generated permission set (wait up to {args.deploy_wait} minute(s))..."
         )
@@ -1271,7 +1417,7 @@ def main():
         print("Deployment command completed successfully.")
 
     print("Done!")
-    if not deployed:
+    if not deployed and not partial_user_permissions:
         print(f'Deploy with: sf project deploy start --ignore-conflicts --source-dir "{output_file}"')
 
     if args.json:
@@ -1283,6 +1429,7 @@ def main():
             "apiVersion": api_version,
             "deployed": deployed,
             "validated": validated,
+            "skippedUserPermissions": unsupported_permissions,
             "counts": {
                 "objectPermissions": len(sorted_objects),
                 "fieldPermissions": len(sorted_fields),
